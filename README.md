@@ -1,1 +1,167 @@
 # Advanced-Financial-Modeling-Group-Project
+import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output
+import pandas as pd
+import plotly.graph_objs as go
+from yahoo_fin import stock_info as si
+import datetime
+from sklearn.linear_model import LinearRegression
+import numpy as np
+import webbrowser
+import threading
+import time
+import os
+import logging
+import smtplib
+import json
+
+# Function to read email user and password from a JSON file
+def read_email_credentials(filename):
+    try:
+        with open(filename, 'r') as file:
+            config_data = json.load(file)
+            email_user = config_data["email_user"]
+            email_pass = config_data["email_pass"]
+            return email_user, email_pass
+    except FileNotFoundError:
+        print(f"Config file '{filename}' not found.")
+        return None, None
+
+# Initialize email user and password
+email_user, email_pass = read_email_credentials('config.json')
+
+if email_user is None or email_pass is None:
+    print("Email user or password not found in the config file. Please provide valid credentials.")
+    exit()
+
+# Prompt for the recipient's email address
+email_recipient = input("Enter the recipient's email address: ")
+
+def send_email(subject, message):
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(email_user, email_pass)
+
+        email_message = f'Subject: {subject}\n\n{message}'
+        server.sendmail(email_user, email_recipient, email_message)
+        server.quit()
+        print("Email sent successfully")
+    except Exception as e:
+        print(f"Error: {e}")
+
+# Function to fetch stock data
+def fetch_stock_data(ticker, start_date, end_date):
+    data = si.get_data(ticker, start_date=start_date, end_date=end_date)
+    data.reset_index(inplace=True)
+    # Connvert the 'date' column to a datetime format
+    data['index'] = pd.to_datetime(data['index'], format='%m/%d/%Y')
+    return data
+
+def predict_stock_price(data):
+    # Convert the 'index' column to datetime format if it's not already
+    data['index'] = pd.to_datetime(data['index'], format='%m/%d/%Y')
+    # Calculate the 'Days' column as the number of days from the start date
+    data['Days'] = (data['index'] - data['index'].min()).dt.days
+    # Create and train the linear regression model
+    model = LinearRegression()
+    model.fit(data['Days'].values.reshape(-1, 1), data['close'].values)
+    # The last actual date in the data
+    last_date = data['index'].iloc[-1]
+    # Generate future dates for prediction, starting from the day after the last actual date
+    future_dates = [last_date + datetime.timedelta(days=x) for x in range(1, 31)]
+    # Convert future dates to 'Days' since the start of the dataset for the model
+    future_days_since_start = [(future_date - data['index'].min()).days for future_date in future_dates]
+    future_days_array = np.array(future_days_since_start).reshape(-1, 1)
+    # Predict future prices using the model
+    predicted_prices = model.predict(future_days_array)
+    return future_dates, predicted_prices
+
+def calculate_price_change(current_price, previous_price):
+    if previous_price == 0:
+        return 0
+    return ((current_price - previous_price) / previous_price) * 100
+
+# Initialize Dash app
+app = dash.Dash(__name__)
+
+# Set logging level to ERROR
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+# App layout
+app.layout = html.Div([
+    html.H1("S&P500 Stock Analyzer"),
+    html.Div([
+        "Input Stock Ticker: ",
+        dcc.Input(id='stock-ticker-input', value='AAPL', type='text')
+    ]),
+    html.Div([
+        "Select Date Range: ",
+        dcc.DatePickerRange(
+            id='date-picker-range',
+            start_date=datetime.datetime.now() - datetime.timedelta(days=365),
+            end_date=datetime.datetime.now(),
+            display_format='YYYY-MM-DD'
+        )
+    ]),
+    html.Button('Submit', id='submit-val', n_clicks=0),
+    dcc.Graph(id='stock-graph')
+])
+
+# Callback to update graph based on input and send email if significant change occurs
+@app.callback(
+    Output('stock-graph', 'figure'),
+    [Input('submit-val', 'n_clicks')],
+    [dash.dependencies.State('stock-ticker-input', 'value'),
+     dash.dependencies.State('date-picker-range', 'start_date'),
+     dash.dependencies.State('date-picker-range', 'end_date')]
+)
+def update_graph(n_clicks, ticker_value, start_date, end_date):
+    if n_clicks > 0:
+        df = fetch_stock_data(ticker_value, start_date, end_date)
+        
+        # Plot historical data using candlestick chart
+        fig = go.Figure(data=[go.Candlestick(x=df['index'],
+                                        open=df['open'],
+                                        high=df['high'],
+                                        low=df['low'],
+                                        close=df['close'])])
+        
+        # Check for significant price changes and send email if needed
+        significant_change = 0.005  # Your defined threshold, currently 0.5%
+        if len(df) > 1:  # Ensure there are at least 2 data points
+            previous_price = df['close'].iloc[-2]
+            current_price = df['close'].iloc[-1]
+            price_change = calculate_price_change(current_price, previous_price)
+            
+            if abs(price_change) >= significant_change:
+                send_email('Stock Alert', f'{ticker_value} has changed by {price_change:.2f}%')
+                        
+        # Predict future prices using the modified function
+        future_dates, future_prices = predict_stock_price(df)
+    
+        # Add the predicted prices to the figure
+        fig.add_trace(go.Scatter(x=future_dates, y=future_prices, mode='lines', name='Predicted'))
+        
+        # Update layout of the figure
+        fig.update_layout(title=f'Stock Data for {ticker_value}', xaxis_title='Date', yaxis_title='Price')
+    
+        return fig
+    else:
+        return dash.no_update
+    
+def open_browser():
+    # Wait for the server to start before opening the browser
+        time.sleep(1)  # Adjust the delay as needed
+        webbrowser.open("http://127.0.0.1:8050")
+
+if __name__ == '__main__':
+
+    if not os.environ.get('DASH_APP_RUNNING'):
+        # Start a thread that will open the web browser
+        threading.Thread(target=open_browser).start()
+        os.environ['DASH_APP_RUNNING'] = '1'
+    
+    # Start the Dash app
+    app.run_server(debug=False)
